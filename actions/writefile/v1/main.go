@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,7 +14,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const mountAction = "/mountAction"
+const (
+	mountAction = "/mountAction"
+	bootConfigAction = "/usr/bin/bootconfig"
+)
 
 func main() {
 	fmt.Printf("WriteFile - Write file to disk\n------------------------\n")
@@ -23,6 +27,7 @@ func main() {
 	filePath := os.Getenv("DEST_PATH")
 
 	contents := os.Getenv("CONTENTS")
+	bootconfig := os.Getenv("BOOTCONFIG_CONTENTS")
 	uid := os.Getenv("UID")
 	gid := os.Getenv("GID")
 	mode := os.Getenv("MODE")
@@ -40,6 +45,10 @@ func main() {
 	modePrime, err := strconv.ParseUint(mode, 8, 32)
 	if err != nil {
 		log.Fatalf("Could not parse mode: %v", err)
+	}
+
+	if bootconfig != "" && contents != "" {
+		log.Fatal("Both BOOTCONFIG_CONTENTS and CONTENTS cannot be set.")
 	}
 
 	fileMode := os.FileMode(modePrime)
@@ -82,10 +91,29 @@ func main() {
 		log.Fatalf("Failed to ensure directory exists: %v", err)
 	}
 
+	// If bootconfig is set, contents will be empty and will serve as output initrd file provided
+	// to bootconfig tool
 	fqFilePath := filepath.Join(mountAction, filePath)
 	// Write the file to disk
 	if err := ioutil.WriteFile(fqFilePath, []byte(contents), fileMode); err != nil {
 		log.Fatalf("Could not write file %s: %v", filePath, err)
+	}
+
+	if bootconfig != "" {
+		// Write the input bootconfig to file to serve as input to the tool
+		inputFilePath := "/userInputBootConfig"
+		err := ioutil.WriteFile(inputFilePath, []byte(bootconfig), fileMode)
+		if err != nil {
+			log.Fatalf("Could not write file %s: %v", filePath, err)
+		}
+		defer os.Remove(inputFilePath)
+
+		// Parse through bootconfig if enabled
+		cmd := exec.Command(bootConfigAction, "-a", inputFilePath, fqFilePath)
+		output, err := cmd.Output()
+		if err != nil {
+			log.Fatalf("Error running Bootconfig tool. Err: %v, Output: %s", err, string(output))
+		}
 	}
 
 	if err := os.Chown(fqFilePath, fileUID, fileGID); err != nil {
