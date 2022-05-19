@@ -4,8 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,6 +20,7 @@ import (
 const (
 	mountAction = "/mountAction"
 	bootConfigAction = "/usr/bin/bootconfig"
+	hegelUserDataVersion = "2009-04-04"
 )
 
 func main() {
@@ -28,6 +32,7 @@ func main() {
 
 	contents := os.Getenv("CONTENTS")
 	bootconfig := os.Getenv("BOOTCONFIG_CONTENTS")
+	hegelUrl := os.Getenv("HEGEL_URL")
 	uid := os.Getenv("UID")
 	gid := os.Getenv("GID")
 	mode := os.Getenv("MODE")
@@ -47,8 +52,15 @@ func main() {
 		log.Fatalf("Could not parse mode: %v", err)
 	}
 
-	if bootconfig != "" && contents != "" {
-		log.Fatal("Both BOOTCONFIG_CONTENTS and CONTENTS cannot be set.")
+	// Only set one of contents, bootconfig or hegelUrl
+	validationCount := 0
+	for _, envVar := range []string{contents, bootconfig, hegelUrl} {
+		if envVar != "" {
+			validationCount++
+		}
+	}
+	if validationCount != 1 {
+		log.Fatal("Only one environment vars of CONTENTS, BOOTCONFIG_CONTENTS, HEGEL_URL can be set")
 	}
 
 	fileMode := os.FileMode(modePrime)
@@ -89,6 +101,28 @@ func main() {
 
 	if err := recursiveEnsureDir(mountAction, dirPath, newDirMode, fileUID, fileGID); err != nil {
 		log.Fatalf("Failed to ensure directory exists: %v", err)
+	}
+
+	// If hegelUrl is set, get the user-data from hegel and set it to contents
+	if hegelUrl != "" {
+		userDataServiceUrl, err := url.Parse(hegelUrl)
+		if err != nil {
+			log.Fatalf("Error parsing hegel url: %v", err)
+		}
+		userDataServiceUrl.Path = path.Join(userDataServiceUrl.Path, hegelUserDataVersion, "user-data")
+		resp, err := http.Get(userDataServiceUrl.String())
+		if err != nil {
+			log.Fatalf("Error with HTTP GET call: %v", err)
+		}
+		defer resp.Body.Close()
+
+		respBody, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Fatalf("Error reading HTTP GET response body: %v", err)
+		}
+
+		// Set contents to be the user-data
+		contents = string(respBody)
 	}
 
 	// If bootconfig is set, contents will be empty and will serve as output initrd file provided
