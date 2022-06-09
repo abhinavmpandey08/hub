@@ -1,27 +1,43 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"html/template"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
 	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netns"
 )
 
 const (
-	mountAction = "/mountAction"
-	bootConfigAction = "/usr/bin/bootconfig"
+	mountAction          = "/mountAction"
+	bootConfigAction     = "/usr/bin/bootconfig"
 	hegelUserDataVersion = "2009-04-04"
 )
+
+type Info struct {
+	HWAddr      net.HardwareAddr
+	IPAddr      net.IPNet
+	Gateway     net.IP
+	Nameservers []net.IP
+}
 
 func main() {
 	fmt.Printf("WriteFile - Write file to disk\n------------------------\n")
@@ -37,6 +53,25 @@ func main() {
 	gid := os.Getenv("GID")
 	mode := os.Getenv("MODE")
 	dirMode := os.Getenv("DIRMODE")
+
+	if os.Getenv("STATIC_NETPLAN") == "true" {
+		ifname := determineNetIF()
+		if f := os.Getenv("IFNAME"); f != "" {
+			ifname = f
+		}
+		var err error
+		timeout := 2 * time.Minute
+		if t := os.Getenv("DHCP_TIMEOUT"); t != "" {
+			timeout, err = time.ParseDuration(t)
+			if err != nil {
+				log.Errorf("Invalid DHCP_TIMEOUT: %s, using default: %v", t, timeout)
+			}
+		}
+		contents, err = dhcpAndWriteNetplan(ifname, timeout)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	// Validate inputs
 	if blockDevice == "" {
@@ -157,6 +192,48 @@ func main() {
 	log.Infof("Successfully wrote file [%s] to device [%s]", filePath, blockDevice)
 }
 
+func determineNetIF() string {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Change to PID 1 network namespace for working with the host's interfaces.
+	ns1, err := netns.GetFromPid(1)
+	if err != nil {
+		return ""
+	}
+	defer ns1.Close()
+	err = netns.Set(ns1)
+	if err != nil {
+		return ""
+	}
+
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, ifi := range ifs {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			break
+		}
+		for _, addr := range addrs {
+			ip, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			v4 := ip.IP.To4()
+			if v4 == nil || !v4.IsGlobalUnicast() {
+				continue
+			}
+
+			return ifi.Name
+		}
+	}
+
+	return ""
+}
+
 func dirExists(mountPath, path string) (bool, error) {
 	fqPath := filepath.Join(mountPath, path)
 	info, err := os.Stat(fqPath)
@@ -228,4 +305,112 @@ func ensureDir(mountPath, path string, mode os.FileMode, uid, gid int) error {
 	log.Infof("Successfully set ownernership of directory %s to %d:%d", path, uid, gid)
 
 	return nil
+}
+
+func dhcpAndWriteNetplan(ifname string, dhcpTimeout time.Duration) (string, error) {
+	// After locking a goroutine to its current OS thread with runtime.LockOSThread()
+	// and changing its network namespace, any new subsequent goroutine won't be scheduled
+	// on that thread while it's locked. Therefore, the new goroutine will run in a
+	// different namespace leading to unexpected results.
+	// See these links for more details:
+	// https://www.weave.works/blog/linux-namespaces-golang-followup
+	// https://github.com/vishvananda/netns
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Change to PID 1 network namespace so we can do a DHCP using the host's interface.
+	ns1, err := netns.GetFromPid(1)
+	if err != nil {
+		return "", err
+	}
+	defer ns1.Close()
+	err = netns.Set(ns1)
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dhcpTimeout)
+	defer cancel()
+	d, err := dhcp(ctx, ifname)
+	if err != nil {
+		return "", err
+	}
+
+	netplanTemplate := `network:
+    version: 2
+    renderer: networkd
+    ethernets:
+        id0:
+            match:
+                macaddress: {{ .HWAddr }}
+            addresses:
+                - {{ ToString .IPAddr }}
+            nameservers:
+                addresses: [{{ ToStringSlice .Nameservers ", " }}]
+            {{- if .Gateway }}
+            routes:
+                - to: default
+                  via: {{ ToString .Gateway }}
+            {{- end }}
+`
+
+	return createNetplan(netplanTemplate, translate(d))
+}
+
+func netIPToString(ip []net.IP, sep string) string {
+	var strs []string
+	for _, i := range ip {
+		strs = append(strs, i.String())
+	}
+	return strings.Join(strs, sep)
+}
+
+func netToString(v interface{}) string {
+	switch n := v.(type) {
+	case net.IP:
+		return n.String()
+	case net.HardwareAddr:
+		return n.String()
+	case net.IPNet:
+		return n.String()
+	}
+
+	return fmt.Sprintf("%v", v)
+}
+
+func createNetplan(tmpl string, i Info) (string, error) {
+	tp, err := template.New("netplan").Funcs(template.FuncMap{"ToStringSlice": netIPToString}).Funcs(template.FuncMap{"ToString": netToString}).Parse(tmpl)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	err = tp.Execute(&buf, i)
+	if err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
+}
+
+func dhcp(ctx context.Context, ifname string) (*dhcpv4.DHCPv4, error) {
+	c, err := nclient4.New(ifname)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+
+	return c.DiscoverOffer(ctx)
+}
+
+func translate(d *dhcpv4.DHCPv4) Info {
+	if d == nil {
+		return Info{}
+	}
+	var info Info
+	info.HWAddr = d.ClientHWAddr
+	info.IPAddr = net.IPNet{IP: d.YourIPAddr, Mask: d.SubnetMask()}
+	info.Gateway = d.GetOneOption(dhcpv4.OptionRouter)
+	info.Nameservers = d.DNS()
+
+	return info
 }
